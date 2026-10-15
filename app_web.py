@@ -1,6 +1,7 @@
 import streamlit as st
 import math
-import random
+import os
+from sgis_households import SGISError, SGISHouseholdClient, DEFAULT_CENSUS_YEAR, classify_site
 from itertools import product
 import folium
 import requests
@@ -47,31 +48,17 @@ def search_places_all(keyword, lat, lng, headers, radius=2000):
         pass
     return results
 
-def get_sgis_population(sgis_key, sgis_secret, lat, lng):
-    fallback_population = random.randint(4500, 8500) 
-    if not sgis_key or not sgis_secret:
-        return fallback_population
-    auth_url = "https://sgisapi.kostat.go.kr/OpenAPI3/auth/authentication.json"
-    try:
-        auth_res = requests.get(auth_url, params={"consumer_key": sgis_key, "consumer_secret": sgis_secret}, timeout=5)
-        if auth_res.status_code == 200:
-            token = auth_res.json().get("result", {}).get("accessToken")
-            if token:
-                return 6200
-    except Exception:
-        pass
-    return fallback_population
-
 # --- 2. 웹 화면 UI 구성 (Streamlit) ---
 st.set_page_config(page_title="메가커피 입지 분석", layout="wide")
 
 st.title("☕ 메가커피 최적 입지 분석 시스템")
 st.write("공공데이터와 카카오 API를 활용하여 최적의 카페 입지를 추천합니다.")
 
-kakao_key = "dec815c33cd47805e601c99e12ebff4d"
+kakao_key = os.getenv("KAKAO_REST_API_KEY") or st.secrets.get("KAKAO_REST_API_KEY", "")
 headers = {"Authorization": f"KakaoAK {kakao_key}"}
-sgis_key = "f29ce54759d9482b9556"
-sgis_secret = "" 
+sgis_key = os.getenv("SGIS_CONSUMER_KEY") or st.secrets.get("SGIS_CONSUMER_KEY", "")
+sgis_secret = os.getenv("SGIS_CONSUMER_SECRET") or st.secrets.get("SGIS_CONSUMER_SECRET", "")
+sgis_year = os.getenv("SGIS_CENSUS_YEAR") or st.secrets.get("SGIS_CENSUS_YEAR", DEFAULT_CENSUS_YEAR)
 
 target_region = st.text_input("분석할 지역명을 입력하세요", "서울특별시 강남구")
 
@@ -98,6 +85,13 @@ if st.session_state.run_analysis:
 
             lat_step, lng_step = 0.009, 0.011
             valid_candidates = []
+            pending_candidates = []
+            sgis_error = None
+            try:
+                sgis_client = SGISHouseholdClient(sgis_key, sgis_secret, sgis_year)
+            except SGISError as exc:
+                sgis_client = None
+                sgis_error = str(exc)
 
             for i, j in product(range(-5, 6), range(-5, 6)):
                 cand_lat = center_lat + (i * lat_step / 5)
@@ -108,28 +102,34 @@ if st.session_state.run_analysis:
                 if sum(1 for s in schools if get_distance(cand_lat, cand_lng, float(s["y"]), float(s["x"])) <= 500) == 0:
                     continue
 
-                households = get_sgis_population(sgis_key, sgis_secret, cand_lat, cand_lng)
-                if households < 5000:
-                    continue
-
                 nearby_churches = [c for c in churches if get_distance(cand_lat, cand_lng, float(c["y"]), float(c["x"])) <= 200]
                 church_count = len(nearby_churches)
-                church_status = "있음" if church_count > 0 else "없음"
-
-                if households >= 7000 and church_count > 0:
-                    grade, color = "A급지", "red"
-                elif households >= 6000:
-                    grade, color = "B급지", "orange"
-                else:
-                    grade, color = "C급지", "green"
+                church_status = "있음" if church_count else "없음"
+                statistic = None
+                if sgis_client and not sgis_error:
+                    try:
+                        statistic = sgis_client.get_sgis_population(cand_lat, cand_lng)
+                    except SGISError as exc:
+                        sgis_error = str(exc)
+                if statistic is None:
+                    pending_candidates.append({"lat": cand_lat, "lng": cand_lng})
+                    continue
+                households = statistic.households
+                grade = classify_site(households, church_count)
+                if grade is None:
+                    continue
+                color = {"A급지": "red", "B급지": "orange", "C급지": "green"}[grade]
 
                 valid_candidates.append({
                     "lat": cand_lat, "lng": cand_lng, "households": households,
                     "church_status": church_status, "church_count": church_count,
-                    "grade": grade, "color": color
+                    "grade": grade, "color": color, "statistic": statistic
                 })
 
-            st.success(f"분석 완료! 총 {len(valid_candidates)}곳의 추천 입지가 도출되었습니다.")
+            if sgis_error:
+                st.warning(f"SGIS 조회 실패: {sgis_error}. 가구 수 미확인 후보의 등급은 보류됩니다.")
+            st.info(f"가구 수는 {sgis_year}년 SGIS 행정동 전체 가구 수입니다. 지도상 500m 원의 가구 수가 아닙니다.")
+            st.success(f"검증된 추천 {len(valid_candidates)}곳 / 가구 수 미확인 {len(pending_candidates)}곳")
 
             m = folium.Map(location=[center_lat, center_lng], zoom_start=14)
 
@@ -144,11 +144,11 @@ if st.session_state.run_analysis:
                 popup_html = f"""
                 <div style="width:150px;">
                     <h4 style="color:{cand['color']}; margin-bottom:5px;"><b>{cand['grade']}</b></h4>
-                    가구수: {cand['households']:,}<br>
+                    행정동 가구 수 ({cand['statistic'].year}년): {cand['households']:,}<br>행정동: {cand['statistic'].adm_nm}<br>
                     교회: {cand['church_status']}
                 </div>
                 """
-                tooltip_text = f"[{cand['grade']}] 가구수: {cand['households']:,}"
+                tooltip_text = f"[{cand['grade']}] 행정동 가구 수: {cand['households']:,}"
                 folium.Marker(
                     [cand["lat"], cand["lng"]], 
                     popup=folium.Popup(popup_html, max_width=200), 
@@ -157,4 +157,7 @@ if st.session_state.run_analysis:
                 ).add_to(m)
                 folium.Circle(location=[cand["lat"], cand["lng"]], radius=500, color=cand["color"], fill=False, dash_array="5, 5").add_to(m)
 
+            for cand in pending_candidates:
+                folium.Marker([cand["lat"], cand["lng"]], tooltip="가구 수 미확인 · 등급 보류",
+                              icon=folium.Icon(color="lightgray", icon="question-sign")).add_to(m)
             st_folium(m, width=1000, height=600, returned_objects=[])
